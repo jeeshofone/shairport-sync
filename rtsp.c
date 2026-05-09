@@ -49,6 +49,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <setjmp.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 
 #include "activity_monitor.h"
@@ -113,6 +115,51 @@
 
 #include "mdns.h"
 #include "utilities/network_utilities.h"
+
+/*
+ * safe_getifaddrs - wrapper around getifaddrs() that survives glibc's
+ * internal abort() on netlink FD race conditions.
+ *
+ * glibc's getifaddrs() opens a netlink socket internally. If another thread
+ * closes that FD (e.g., during AirPlay connection teardown), glibc detects
+ * EBADF and calls abort() via __netlink_assert_response. This kills the
+ * entire process.
+ *
+ * This wrapper uses sigsetjmp/siglongjmp to catch the SIGABRT and return
+ * gracefully with an error instead of crashing.
+ *
+ * See: https://github.com/mikebrady/shairport-sync/issues/2184
+ */
+static __thread sigjmp_buf _safe_getifaddrs_jmp;
+static __thread volatile sig_atomic_t _safe_getifaddrs_active = 0;
+
+static void _safe_getifaddrs_handler(int sig) {
+  (void)sig;
+  if (_safe_getifaddrs_active)
+    siglongjmp(_safe_getifaddrs_jmp, 1);
+  _exit(1);
+}
+
+static int safe_getifaddrs(struct ifaddrs **ifap) {
+  struct sigaction sa, old_sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = _safe_getifaddrs_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGABRT, &sa, &old_sa);
+
+  _safe_getifaddrs_active = 1;
+  int ret;
+  if (sigsetjmp(_safe_getifaddrs_jmp, 1) == 0) {
+    ret = getifaddrs(ifap);
+  } else {
+    /* Recovered from glibc abort inside getifaddrs */
+    *ifap = NULL;
+    ret = -1;
+  }
+  _safe_getifaddrs_active = 0;
+  sigaction(SIGABRT, &old_sa, NULL);
+  return ret;
+}
 
 #define METADATA_SNDBUF (4 * 1024 * 1024)
 
@@ -2831,7 +2878,12 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
               int oldState;
               pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
               struct ifaddrs *addrs, *iap;
-              getifaddrs(&addrs);
+              if (safe_getifaddrs(&addrs) != 0) {
+                debug(1, "Connection %d: getifaddrs() failed (netlink FD race). "
+                         "Continuing with self_ip_string only.",
+                      conn->connection_number);
+                addrs = NULL;
+              }
               for (iap = addrs; iap != NULL; iap = iap->ifa_next) {
                 // debug(1, "Interface index %d, name: \"%s\"",if_nametoindex(iap->ifa_name),
                 // iap->ifa_name);
@@ -2863,7 +2915,8 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
                   }
                 }
               }
-              freeifaddrs(addrs);
+              if (addrs)
+                freeifaddrs(addrs);
               pthread_setcancelstate(oldState, NULL);
 
               // debug(1,"initial timing peer command: \"%s\".", timing_list_message);
