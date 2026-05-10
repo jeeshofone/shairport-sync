@@ -521,6 +521,14 @@ play_lock_r get_play_lock(rtsp_conn_info *conn, int allow_session_interruption) 
       rtsp_conn_info *previous_principal_conn = principal_conn;
       principal_conn = conn;                           // make the conn the new principal_conn
       pthread_cancel(previous_principal_conn->thread); // cancel the previous one...
+      debug(1, "Connection %d: waiting for old connection %d thread to finish cleanup...",
+            conn->connection_number, previous_principal_conn->connection_number);
+      pthread_join(previous_principal_conn->thread, NULL); // wait for cleanup to complete
+      debug(1, "Connection %d: old connection %d cleanup complete. Safe to proceed with setup.",
+            conn->connection_number, previous_principal_conn->connection_number);
+      // This join ensures all FDs from the old connection are closed before
+      // the new connection proceeds to handle_setup_2, preventing the netlink
+      // FD race in getifaddrs(). See: https://github.com/mikebrady/shairport-sync/issues/2184
 
       if (principal_conn == NULL) {
 #ifdef CONFIG_AIRPLAY_2
